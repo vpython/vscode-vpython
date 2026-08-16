@@ -39,21 +39,43 @@ function loadCss(name) {
   document.head.appendChild(link);
 }
 
+// If the webview exposes an AMD loader, UMD scripts register as modules
+// instead of patching globals — jQuery core still sets window.$ either way,
+// but jQuery UI then NEVER extends $.fn (no .resizable, which glow's canvas
+// activation needs). Hide `define` while our classic scripts execute.
+function suppressAmd() {
+  const had = Object.prototype.hasOwnProperty.call(self, 'define');
+  const saved = self.define;
+  try { self.define = undefined; } catch (e) { /* frozen? proceed anyway */ }
+  return () => {
+    if (had) { self.define = saved; }
+    else { try { delete self.define; } catch (e) { /* best effort */ } }
+  };
+}
+
 function ensureGlow() {
   if (!glowReady) {
     // Order matters: glow expects jQuery AND jQuery UI (canvas activation
     // calls $(wrapper).resizable()); glowcomm_host expects glow's
     // constructors (and finds jQuery through the same globals).
     loadCss('jquery-ui.custom.css');
+    const restoreAmd = suppressAmd();
     glowReady = loadScript('jquery.min.js')
       .then(() => loadScript('jquery-ui.custom.min.js'))
       .then(() => loadScript('glow.min.js'))
       .then(() => loadScript('glowcomm_host.js'))
       .then(() => {
+        restoreAmd();
+        const jq = self.$ || self.jQuery;
+        if (!jq || !jq.fn || typeof jq.fn.resizable !== 'function') {
+          throw new Error('jQuery UI did not attach ($.fn.resizable missing) — ' +
+            'AMD/UMD interference in this webview');
+        }
         if (typeof self.createGlowFrontend !== 'function') {
           throw new Error('glowcomm_host.js loaded but createGlowFrontend missing');
         }
-      });
+      })
+      .catch((e) => { restoreAmd(); throw e; });
   }
   return glowReady;
 }
