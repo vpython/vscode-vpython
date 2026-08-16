@@ -63,6 +63,24 @@ function ensureGlow() {
     glowReady = loadScript('jquery.min.js')
       .then(() => loadScript('jquery-ui.custom.min.js'))
       .then(() => loadScript('glow.min.js'))
+      .then(() => {
+        // glow.min reads this global as the URL prefix for textures
+        // (textures.earth et al) — must end with '/'.
+        self.Jupyter_VPython = new URL('./media/data/', import.meta.url).toString();
+        // Fonts for text(): glow bundles opentype.js and exposes
+        // opentype_load; glow's text machinery reads __font_sans/__font_serif.
+        const loadFont = (file, slot) => new Promise((resolve, reject) => {
+          self.opentype_load(self.Jupyter_VPython + file, (err, font) => {
+            if (err) { reject(new Error('font ' + file + ': ' + err)); return; }
+            self[slot] = font;
+            resolve();
+          });
+        });
+        return Promise.all([
+          loadFont('Roboto-Medium.ttf', '__font_sans'),
+          loadFont('NimbusRomNo9L-Med.otf', '__font_serif')
+        ]);
+      })
       .then(() => loadScript('glowcomm_host.js'))
       .then(() => {
         restoreAmd();
