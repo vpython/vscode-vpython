@@ -577,6 +577,13 @@ function createGlowFrontend(opts) {
             var idx = cmd.idx;
             delete cmd.cmd;
             delete cmd.idx;
+            if (obj === 'reset') {
+                // Scene replay (ephemeral frontends): the kernel is about to
+                // resend every constructor, so take the old objects off the
+                // page and forget them.
+                destroy();
+                continue;
+            }
             var construct = (obj !== undefined);
             var method = null;
             if ('method' in cmd) {
