@@ -32,11 +32,21 @@ function loadScript(name) {
   });
 }
 
+function loadCss(name) {
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = new URL('./media/' + name, import.meta.url).toString();
+  document.head.appendChild(link);
+}
+
 function ensureGlow() {
   if (!glowReady) {
-    // Order matters: glow expects jQuery; glowcomm_host expects glow's
+    // Order matters: glow expects jQuery AND jQuery UI (canvas activation
+    // calls $(wrapper).resizable()); glowcomm_host expects glow's
     // constructors (and finds jQuery through the same globals).
+    loadCss('jquery-ui.custom.css');
     glowReady = loadScript('jquery.min.js')
+      .then(() => loadScript('jquery-ui.custom.min.js'))
       .then(() => loadScript('glow.min.js'))
       .then(() => loadScript('glowcomm_host.js'))
       .then(() => {
