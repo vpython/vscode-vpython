@@ -100,12 +100,14 @@ function ensureGlow() {
 
 // ---- per-output scene state ----------------------------------------------
 
-const scenes = new Map(); // outputId -> { ws, fe, pacer, container }
+const scenes = new Map(); // outputId -> { ws, fe, pacer, container, retryTimer, disposed }
 
 function disposeScene(outputId) {
   const s = scenes.get(outputId);
   if (!s) { return; }
   scenes.delete(outputId);
+  s.disposed = true;
+  if (s.retryTimer) { clearTimeout(s.retryTimer); }
   if (s.pacer) { clearInterval(s.pacer); }
   if (s.ws) { try { s.ws.close(); } catch (e) { /* already closed */ } }
   if (s.fe) { try { s.fe.destroy(); } catch (e) { /* scene half-built */ } }
@@ -149,49 +151,85 @@ export function activate(_context) {
       ensureGlow().then(() => {
         // The kernel and this UI share a machine in v1; remote kernels need
         // extension-host port forwarding (asExternalUri) — future work.
+        // Until then the renderer RETRIES instead of failing on the first
+        // attempt: a forward can come up after this output renders
+        // (Codespaces auto-forward, a manual Ports-view forward), and an
+        // established tunnel can drop and return. Reconnecting is always
+        // safe — the kernel replays the whole scene on every attach.
         const url = 'ws://127.0.0.1:' + info.port + (info.wsuri || '/ws');
-        status.textContent = 'VPython: connecting ' + url + ' …';
-
-        const ws = new WebSocket(url);
-        const state = { ws, fe: null, pacer: null, container };
+        const state = { ws: null, fe: null, pacer: null, container,
+                        retryTimer: null, disposed: false };
         scenes.set(outputId, state);
 
-        ws.onopen = () => {
-          state.fe = self.createGlowFrontend({
-            container: container,
-            glow: self,
-            send: (events) => {
-              if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(events));
-              }
+        const RETRY_MS = 2000;
+        const GIVE_UP_MS = 5 * 60 * 1000;
+        const forwardHint = 'for a remote kernel (Codespace/SSH), forward ' +
+          'port ' + info.port + ' in the Ports view';
+        let everConnected = false;
+        let windowStart = Date.now(); // resets on every successful open
+
+        const connect = () => {
+          if (state.disposed) { return; }
+          status.textContent = 'VPython: connecting ' + url + ' …';
+          const ws = new WebSocket(url);
+          state.ws = ws;
+
+          ws.onopen = () => {
+            everConnected = true;
+            windowStart = Date.now();
+            if (!state.fe) {
+              state.fe = self.createGlowFrontend({
+                container: container,
+                glow: self,
+                send: (events) => {
+                  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                    state.ws.send(JSON.stringify(events));
+                  }
+                }
+              });
             }
-          });
-          state.pacer = setInterval(() => state.fe.tick(), TICK_MS);
-          status.textContent = '';
-        };
+            if (!state.pacer) {
+              state.pacer = setInterval(() => state.fe.tick(), TICK_MS);
+            }
+            status.textContent = '';
+          };
 
-        ws.onmessage = (ev) => {
-          if (!state.fe) { return; }
-          try {
-            state.fe.handle(ev.data === 'trigger' ? 'trigger' : JSON.parse(ev.data));
-          } catch (e) {
-            fail('protocol error: ' + ((e && e.stack) || e));
-          }
-        };
+          ws.onmessage = (ev) => {
+            if (!state.fe) { return; }
+            try {
+              state.fe.handle(ev.data === 'trigger' ? 'trigger' : JSON.parse(ev.data));
+            } catch (e) {
+              fail('protocol error: ' + ((e && e.stack) || e));
+            }
+          };
 
-        ws.onclose = () => {
-          if (state.pacer) { clearInterval(state.pacer); state.pacer = null; }
-          if (state.fe) { state.fe.pacingStopped(); }
-          status.textContent = 'VPython: kernel connection closed ' +
-            '(re-run the cell to start a new scene).';
-        };
+          // onerror is always followed by onclose; retry logic lives there.
+          ws.onerror = () => {};
 
-        ws.onerror = () => {
-          if (ws.readyState !== WebSocket.OPEN) {
-            fail('could not reach the kernel websocket at ' + url +
-                 ' — is the kernel still running on this machine?');
-          }
+          ws.onclose = () => {
+            if (state.disposed) { return; }
+            if (state.pacer) { clearInterval(state.pacer); state.pacer = null; }
+            if (state.fe) { state.fe.pacingStopped(); }
+            if (Date.now() - windowStart > GIVE_UP_MS) {
+              status.textContent = '';
+              fail(everConnected
+                ? 'kernel connection lost at ' + url +
+                  ' (re-run the cell to start a new scene).'
+                : 'could not reach the kernel websocket at ' + url +
+                  ' after ' + (GIVE_UP_MS / 60000) + ' minutes — is the ' +
+                  'kernel running? (' + forwardHint + ')');
+              return;
+            }
+            status.textContent = 'VPython: waiting for ' + url +
+              ' — retrying every ' + (RETRY_MS / 1000) + ' s (' +
+              forwardHint + ')';
+            state.retryTimer = setTimeout(() => {
+              state.retryTimer = null;
+              connect();
+            }, RETRY_MS);
+          };
         };
+        connect();
       }).catch((e) => fail((e && e.stack) || String(e)));
     },
 

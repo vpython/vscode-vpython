@@ -2,7 +2,7 @@
   "name": "vscode-vpython",
   "displayName": "VPython",
   "description": "Render VPython 3D scenes in VS Code notebooks (vpython-jupyter websocket frontend)",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "vpython",
   "license": "MIT",
   "engines": {
