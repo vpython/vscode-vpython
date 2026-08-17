@@ -1,0 +1,24 @@
+{
+	// Codespace test bench for the VPython extension: pinned Python with the
+	// websocket-frontend vpython branch preinstalled, so a fresh codespace can
+	// run test-workspace/codespace-probe.ipynb with zero provisioning.
+	//
+	// A course repo would use the same recipe — students open a codespace and
+	// every dependency is already there.
+	"name": "VPython (websocket frontend)",
+	"image": "mcr.microsoft.com/devcontainers/python:3.12",
+	"postCreateCommand": "pip install ipykernel 'git+https://github.com/vpython/vpython-jupyter@feat/vscode-frontend'",
+	"customizations": {
+		"vscode": {
+			// TODO once vpython.vscode-vpython is on the Marketplace, add it
+			// here — then the renderer+extension install themselves too and
+			// the experience is fully zero-config. Until then: install the
+			// vsix from the workspace root into the codespace
+			// (code --install-extension vscode-vpython-<version>.vsix).
+			"extensions": [
+				"ms-python.python",
+				"ms-toolsai.jupyter"
+			]
+		}
+	}
+}
