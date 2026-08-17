@@ -20,6 +20,11 @@
 			"onAutoForward": "silent"
 		}
 	},
+	// Keep the Ports view quiet: codespaces auto-forward process-scans, so
+	// every kernel restart would otherwise add a batch of ZMQ-port rows.
+	"otherPortsAttributes": {
+		"onAutoForward": "ignore"
+	},
 	"customizations": {
 		"vscode": {
 			// TODO once vpython.vscode-vpython is on the Marketplace, add it

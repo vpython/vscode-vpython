@@ -100,7 +100,7 @@ function ensureGlow() {
 
 // ---- per-output scene state ----------------------------------------------
 
-const scenes = new Map(); // outputId -> { ws, fe, pacer, container, retryTimer, disposed }
+const scenes = new Map(); // outputId -> scene state (see renderOutputItem)
 
 function disposeScene(outputId) {
   const s = scenes.get(outputId);
@@ -108,8 +108,9 @@ function disposeScene(outputId) {
   scenes.delete(outputId);
   s.disposed = true;
   if (s.retryTimer) { clearTimeout(s.retryTimer); }
+  if (s.attemptTimer) { clearTimeout(s.attemptTimer); }
   if (s.pacer) { clearInterval(s.pacer); }
-  if (s.ws) { try { s.ws.close(); } catch (e) { /* already closed */ } }
+  if (s.transport) { s.transport.close(); }
   if (s.fe) { try { s.fe.destroy(); } catch (e) { /* scene half-built */ } }
 }
 
@@ -123,10 +124,34 @@ export function activate(context) {
   // retry loop, so a lost message heals itself.
   const mappedPorts = new Map(); // port -> external URI string
   const canMessage = typeof context.postMessage === 'function';
+
+  // ws bridge (preferred transport): the extension host dials the kernel's
+  // websocket at ITS 127.0.0.1 — the kernel's own machine in every setup —
+  // and relays frames over renderer messaging. 'unavailable' (no WebSocket
+  // client in the host's Node) is permanent for the session; silence just
+  // means the host isn't activated (yet) and the caller times out.
+  let bridgeBroken = false;       // host answered 'ws.unavailable'
+  const bridgeConns = new Map();  // id -> {onopen, onmessage, onclose}
+  let bridgeSeq = 0;
+
   if (canMessage && typeof context.onDidReceiveMessage === 'function') {
     context.onDidReceiveMessage((msg) => {
-      if (msg && msg.type === 'portMapped' && msg.externalUri) {
+      if (!msg) { return; }
+      if (msg.type === 'portMapped' && msg.externalUri) {
         mappedPorts.set(msg.port, msg.externalUri);
+        return;
+      }
+      const conn = msg.id !== undefined && bridgeConns.get(msg.id);
+      if (!conn) { return; }
+      if (msg.type === 'ws.opened') { conn.onopen(); }
+      else if (msg.type === 'ws.message') { conn.onmessage(msg.data); }
+      else if (msg.type === 'ws.closed' || msg.type === 'ws.error') {
+        bridgeConns.delete(msg.id);
+        conn.onclose();
+      } else if (msg.type === 'ws.unavailable') {
+        bridgeBroken = true;
+        bridgeConns.delete(msg.id);
+        conn.onclose();
       }
     });
   }
@@ -134,6 +159,35 @@ export function activate(context) {
     if (canMessage && !mappedPorts.has(port)) {
       context.postMessage({ type: 'mapPort', port: port });
     }
+  };
+
+  // Both transports present the same shape: {send, close}, with the
+  // caller's handlers {onopen, onmessage(str), onclose} driven by events.
+  // id must be unique across webviews too — the host keys sockets by it.
+  const bridgeTag = Math.random().toString(36).slice(2, 10);
+  const openBridgeTransport = (info, handlers) => {
+    const id = 'vp-' + bridgeTag + '-' + (++bridgeSeq);
+    bridgeConns.set(id, handlers);
+    context.postMessage({ type: 'ws.open', id: id, port: info.port,
+                          path: info.wsuri || '/ws' });
+    return {
+      send: (data) => context.postMessage({ type: 'ws.send', id: id, data: data }),
+      close: () => {
+        bridgeConns.delete(id);
+        context.postMessage({ type: 'ws.close', id: id });
+      },
+    };
+  };
+  const openDirectTransport = (url, handlers) => {
+    const ws = new WebSocket(url);
+    ws.onopen = () => handlers.onopen();
+    ws.onmessage = (ev) => handlers.onmessage(ev.data);
+    ws.onclose = () => handlers.onclose();
+    ws.onerror = () => { /* onclose always follows */ };
+    return {
+      send: (data) => { if (ws.readyState === WebSocket.OPEN) { ws.send(data); } },
+      close: () => { try { ws.close(); } catch (e) { /* already closed */ } },
+    };
   };
   const wsUrlFor = (info) => {
     const path = info.wsuri || '/ws';
@@ -180,87 +234,130 @@ export function activate(context) {
       status.textContent = 'VPython: loading GlowScript…';
 
       ensureGlow().then(() => {
-        // The renderer RETRIES instead of failing on the first attempt: the
-        // extension host's port mapping (asExternalUri) can answer after
-        // this output renders, a forward can come up late, and an
-        // established tunnel can drop and return. Reconnecting is always
-        // safe — the kernel replays the whole scene on every attach. The
-        // ws URL is recomputed per attempt so an arriving mapping switches
-        // the very next try.
-        const state = { ws: null, fe: null, pacer: null, container,
-                        retryTimer: null, disposed: false };
+        // Transport preference: the extension-host ws BRIDGE (works in
+        // every setup — the host dials the kernel's own 127.0.0.1, no port
+        // forward or tunnel auth), then a DIRECT websocket (mapped through
+        // asExternalUri when the host answered, plain localhost otherwise).
+        // The renderer RETRIES on a fixed cadence: the extension host can
+        // activate after this output renders, forwards can come up late,
+        // and connections can drop. Reconnecting is always safe — the
+        // kernel replays the whole scene on every attach.
+        const state = { transport: null, fe: null, pacer: null, container,
+                        retryTimer: null, attemptTimer: null, disposed: false };
         scenes.set(outputId, state);
 
         const RETRY_MS = 2000;
+        const ATTEMPT_MS = 8000;   // a hung handshake must not stall the loop
+        const BRIDGE_WAIT_MS = 1500; // silent host (not activated yet)
         const GIVE_UP_MS = 5 * 60 * 1000;
-        const forwardHint = 'for a remote kernel (Codespace/SSH), forward ' +
-          'port ' + info.port + ' in the Ports view';
         let everConnected = false;
         let windowStart = Date.now(); // resets on every successful open
-        let url = wsUrlFor(info);
+        let lastTried = 'kernel port ' + info.port;
+
+        const opened = (transport) => {
+          everConnected = true;
+          windowStart = Date.now();
+          state.transport = transport;
+          if (!state.fe) {
+            state.fe = self.createGlowFrontend({
+              container: container,
+              glow: self,
+              send: (events) => {
+                if (state.transport) { state.transport.send(JSON.stringify(events)); }
+              }
+            });
+          }
+          if (!state.pacer) {
+            state.pacer = setInterval(() => state.fe.tick(), TICK_MS);
+          }
+          status.textContent = '';
+        };
+
+        const onmessage = (data) => {
+          if (!state.fe) { return; }
+          try {
+            state.fe.handle(data === 'trigger' ? 'trigger' : JSON.parse(data));
+          } catch (e) {
+            fail('protocol error: ' + ((e && e.stack) || e));
+          }
+        };
+
+        const clearAttempt = () => {
+          if (state.attemptTimer) { clearTimeout(state.attemptTimer); state.attemptTimer = null; }
+        };
+
+        const dropped = () => {
+          if (state.disposed) { return; }
+          clearAttempt();
+          state.transport = null;
+          if (state.pacer) { clearInterval(state.pacer); state.pacer = null; }
+          if (state.fe) { state.fe.pacingStopped(); }
+          if (Date.now() - windowStart > GIVE_UP_MS) {
+            status.textContent = '';
+            fail(everConnected
+              ? 'kernel connection lost (' + lastTried + ') — re-run the ' +
+                'cell to start a new scene.'
+              : 'could not reach the kernel (' + lastTried + ') after ' +
+                (GIVE_UP_MS / 60000) + ' minutes — is the kernel running? ' +
+                'For a remote kernel (Codespace/SSH), make sure the VPython ' +
+                'extension is installed on the remote ("Install in ' +
+                'Codespace" in the Extensions view).');
+            return;
+          }
+          status.textContent = 'VPython: waiting for the kernel (' +
+            lastTried + ') — retrying every ' + (RETRY_MS / 1000) + ' s …';
+          state.retryTimer = setTimeout(() => {
+            state.retryTimer = null;
+            connect();
+          }, RETRY_MS);
+        };
+
+        // One attempt on one transport; times out into onfail rather than
+        // hanging (observed: a tunnel can hold a handshake open forever).
+        const attempt = (openTransport, waitMs, onfail) => {
+          let settled = false;
+          const transport = openTransport({
+            onopen: () => {
+              if (settled || state.disposed) { return; }
+              settled = true;
+              clearAttempt();
+              opened(transport);
+            },
+            onmessage: onmessage,
+            onclose: () => {
+              if (settled) { dropped(); return; }
+              settled = true;
+              clearAttempt();
+              onfail();
+            },
+          });
+          state.attemptTimer = setTimeout(() => {
+            state.attemptTimer = null;
+            if (settled || state.disposed) { return; }
+            settled = true;
+            transport.close();
+            onfail();
+          }, waitMs);
+        };
+
+        const tryDirect = () => {
+          if (state.disposed) { return; }
+          const url = wsUrlFor(info);
+          lastTried = url;
+          status.textContent = 'VPython: connecting ' + url + ' …';
+          attempt((h) => openDirectTransport(url, h), ATTEMPT_MS, dropped);
+        };
 
         const connect = () => {
           if (state.disposed) { return; }
-          requestPortMap(info.port);
-          url = wsUrlFor(info);
-          status.textContent = 'VPython: connecting ' + url + ' …';
-          const ws = new WebSocket(url);
-          state.ws = ws;
-
-          ws.onopen = () => {
-            everConnected = true;
-            windowStart = Date.now();
-            if (!state.fe) {
-              state.fe = self.createGlowFrontend({
-                container: container,
-                glow: self,
-                send: (events) => {
-                  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-                    state.ws.send(JSON.stringify(events));
-                  }
-                }
-              });
-            }
-            if (!state.pacer) {
-              state.pacer = setInterval(() => state.fe.tick(), TICK_MS);
-            }
-            status.textContent = '';
-          };
-
-          ws.onmessage = (ev) => {
-            if (!state.fe) { return; }
-            try {
-              state.fe.handle(ev.data === 'trigger' ? 'trigger' : JSON.parse(ev.data));
-            } catch (e) {
-              fail('protocol error: ' + ((e && e.stack) || e));
-            }
-          };
-
-          // onerror is always followed by onclose; retry logic lives there.
-          ws.onerror = () => {};
-
-          ws.onclose = () => {
-            if (state.disposed) { return; }
-            if (state.pacer) { clearInterval(state.pacer); state.pacer = null; }
-            if (state.fe) { state.fe.pacingStopped(); }
-            if (Date.now() - windowStart > GIVE_UP_MS) {
-              status.textContent = '';
-              fail(everConnected
-                ? 'kernel connection lost at ' + url +
-                  ' (re-run the cell to start a new scene).'
-                : 'could not reach the kernel websocket at ' + url +
-                  ' after ' + (GIVE_UP_MS / 60000) + ' minutes — is the ' +
-                  'kernel running? (' + forwardHint + ')');
-              return;
-            }
-            status.textContent = 'VPython: waiting for ' + url +
-              ' — retrying every ' + (RETRY_MS / 1000) + ' s (' +
-              forwardHint + ')';
-            state.retryTimer = setTimeout(() => {
-              state.retryTimer = null;
-              connect();
-            }, RETRY_MS);
-          };
+          requestPortMap(info.port); // keeps the direct fallback viable
+          if (canMessage && !bridgeBroken) {
+            lastTried = 'extension-host bridge to kernel port ' + info.port;
+            status.textContent = 'VPython: connecting via ' + lastTried + ' …';
+            attempt((h) => openBridgeTransport(info, h), BRIDGE_WAIT_MS, tryDirect);
+          } else {
+            tryDirect();
+          }
         };
         connect();
       }).catch((e) => fail((e && e.stack) || String(e)));
