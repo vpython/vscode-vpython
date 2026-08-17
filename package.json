@@ -5,6 +5,10 @@
   "version": "0.1.7",
   "publisher": "vpython",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vpython/vscode-vpython.git"
+  },
   "main": "./extension.js",
   "activationEvents": [
     "onRenderer:vpython-renderer"
