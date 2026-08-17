@@ -113,7 +113,38 @@ function disposeScene(outputId) {
   if (s.fe) { try { s.fe.destroy(); } catch (e) { /* scene half-built */ } }
 }
 
-export function activate(_context) {
+export function activate(context) {
+  // Remote kernels (Codespace / Remote-SSH / WSL): 127.0.0.1 is the wrong
+  // machine. The extension host maps the announced port with asExternalUri
+  // (which also CREATES the forward) and answers with the reachable URI.
+  // Until an answer arrives — messaging may be unavailable, and a request
+  // can race extension activation — the direct localhost URL is used, which
+  // is correct for local kernels. Requests are re-sent from the connect
+  // retry loop, so a lost message heals itself.
+  const mappedPorts = new Map(); // port -> external URI string
+  const canMessage = typeof context.postMessage === 'function';
+  if (canMessage && typeof context.onDidReceiveMessage === 'function') {
+    context.onDidReceiveMessage((msg) => {
+      if (msg && msg.type === 'portMapped' && msg.externalUri) {
+        mappedPorts.set(msg.port, msg.externalUri);
+      }
+    });
+  }
+  const requestPortMap = (port) => {
+    if (canMessage && !mappedPorts.has(port)) {
+      context.postMessage({ type: 'mapPort', port: port });
+    }
+  };
+  const wsUrlFor = (info) => {
+    const path = info.wsuri || '/ws';
+    const ext = mappedPorts.get(info.port);
+    if (ext) {
+      // http(s)://host[:port]/ -> ws(s)://host[:port] + path
+      return ext.replace(/^http/, 'ws').replace(/\/+$/, '') + path;
+    }
+    return 'ws://127.0.0.1:' + info.port + path;
+  };
+
   return {
     renderOutputItem(outputItem, element) {
       const outputId = outputItem.id;
@@ -149,14 +180,13 @@ export function activate(_context) {
       status.textContent = 'VPython: loading GlowScript…';
 
       ensureGlow().then(() => {
-        // The kernel and this UI share a machine in v1; remote kernels need
-        // extension-host port forwarding (asExternalUri) — future work.
-        // Until then the renderer RETRIES instead of failing on the first
-        // attempt: a forward can come up after this output renders
-        // (Codespaces auto-forward, a manual Ports-view forward), and an
+        // The renderer RETRIES instead of failing on the first attempt: the
+        // extension host's port mapping (asExternalUri) can answer after
+        // this output renders, a forward can come up late, and an
         // established tunnel can drop and return. Reconnecting is always
-        // safe — the kernel replays the whole scene on every attach.
-        const url = 'ws://127.0.0.1:' + info.port + (info.wsuri || '/ws');
+        // safe — the kernel replays the whole scene on every attach. The
+        // ws URL is recomputed per attempt so an arriving mapping switches
+        // the very next try.
         const state = { ws: null, fe: null, pacer: null, container,
                         retryTimer: null, disposed: false };
         scenes.set(outputId, state);
@@ -167,9 +197,12 @@ export function activate(_context) {
           'port ' + info.port + ' in the Ports view';
         let everConnected = false;
         let windowStart = Date.now(); // resets on every successful open
+        let url = wsUrlFor(info);
 
         const connect = () => {
           if (state.disposed) { return; }
+          requestPortMap(info.port);
+          url = wsUrlFor(info);
           status.textContent = 'VPython: connecting ' + url + ' …';
           const ws = new WebSocket(url);
           state.ws = ws;
