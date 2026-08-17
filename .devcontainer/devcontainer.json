@@ -8,6 +8,18 @@
 	"name": "VPython (websocket frontend)",
 	"image": "mcr.microsoft.com/devcontainers/python:3.12",
 	"postCreateCommand": "pip install ipykernel 'git+https://github.com/vpython/vpython-jupyter@feat/vscode-frontend'",
+	// Pinned ws port: per-port forwards/visibility survive kernel restarts
+	// only if the port never changes.
+	"containerEnv": {
+		"VPYTHON_WS_PORT": "8765"
+	},
+	"forwardPorts": [8765],
+	"portsAttributes": {
+		"8765": {
+			"label": "vpython websocket",
+			"onAutoForward": "silent"
+		}
+	},
 	"customizations": {
 		"vscode": {
 			// TODO once vpython.vscode-vpython is on the Marketplace, add it
