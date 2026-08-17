@@ -7,6 +7,11 @@
 	// every dependency is already there.
 	"name": "VPython (websocket frontend)",
 	"image": "mcr.microsoft.com/devcontainers/python:3.12",
+	// sshd: the universal image bundles one, this slim image doesn't —
+	// without it `gh codespace ssh` (and headless provisioning) can't work.
+	"features": {
+		"ghcr.io/devcontainers/features/sshd:1": {}
+	},
 	"postCreateCommand": "pip install ipykernel 'git+https://github.com/vpython/vpython-jupyter@feat/vscode-frontend'",
 	// Pinned ws port: per-port forwards/visibility survive kernel restarts
 	// only if the port never changes.
